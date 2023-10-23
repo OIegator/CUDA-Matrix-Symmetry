@@ -33,17 +33,19 @@ void PrintMatrix(int* matrix, int rows, int cols) {
     }
 }
 
-// Функция на CPU для проверки симметрии строки относительно средней вертикальной линии матрицы
-bool IsRowSymmetric(int* row, int length) {
-    for (int i = 0; i < length / 2; ++i) {
-        if (row[i] != row[length - i - 1]) {
-            return false;
+// Функция на CPU для проверки симметрии строк относительно средней вертикальной линии матрицы
+void checkSymmetryCPU(const int* matrix, bool* result, int rows, int cols) {
+    for (int i = 0; i < rows; i++) {
+        result[i] = true;
+        for (int j = 0; j < cols / 2; j++) {
+            if (matrix[i * cols + j] != matrix[i * cols + (cols - 1 - j)]) {
+                result[i] = false;  
+            }
         }
     }
-    return true;
 }
 
-// Функция на GPU для проверки симметрии строки относительно средней вертикальной линии матрицы
+// Функция на GPU для проверки симметрии строк относительно средней вертикальной линии матрицы
 __global__ void _IsRowSymmetricGPU(const int* matrix, bool* result, int rows, int cols) {
     int rowIdx = blockIdx.x * blockDim.x + threadIdx.x;
     if (rowIdx < rows) {
@@ -56,8 +58,9 @@ __global__ void _IsRowSymmetricGPU(const int* matrix, bool* result, int rows, in
         }
     }
 }
-// Оптимизированная функция на GPU для проверки симметрии строки относительно средней вертикальной линии матрицы
-__global__ void IsRowSymmetricGPU(int* matrix, int* result, int rows, int cols) {
+
+// Оптимизированная функция на GPU для проверки симметрии строк относительно средней вертикальной линии матрицы
+__global__ void checkSymmetryGPU(int* matrix, bool* result, int rows, int cols) {
     __shared__ int sharedCache[256][32]; // Кеш в разделяемой памяти для 256 строк, каждая строка - 16 элементов слева + 16 элементов справа
 
     const int t = threadIdx.x;
@@ -65,26 +68,25 @@ __global__ void IsRowSymmetricGPU(int* matrix, int* result, int rows, int cols) 
     bool isSymmetric = true;
     for (int part = 0; part < cols / 32; part++) {
         // Загружаем 16 элементов слева и 16 элементов справа в кеш для каждой из 256 строк
-        for (int k = 0; k < 16; ++k) {
+        for (int k = 0; k < 16; k++) {
 
-            sharedCache[t / 16 + k * 16][t % 16] = matrix[(bx / 16 * blockDim.x + t / 16 + k * 16) * cols + part * 16 + t % 16];
-            sharedCache[t / 16 + k * 16][32 - 1 - t % 16] = matrix[(bx / 16 * blockDim.x + t / 16 + k * 16) * cols + cols - 1 - part * 16 - t % 16];
+            sharedCache[t / 16 + k * 16][t % 16] = matrix[(bx * blockDim.x + t / 16 + k * 16) * cols + part * 16 + t % 16];
+            sharedCache[t / 16 + k * 16][32 - 1 - t % 16] = matrix[(bx * blockDim.x + t / 16 + k * 16) * cols + cols - 1 - part * 16 - t % 16];
         }
 
         // Барьер синхронизации для ожидания, пока все потоки загрузят кеш
         __syncthreads();
 
         // Проверяем симметрию для текущей строки
-        for (int j = 0; j < 16; ++j) {
+        for (int j = 0; j < 32 / 2; j++) {
             if (sharedCache[t][j] != sharedCache[t][32 - 1 - j]) {
                 isSymmetric = false; 
             }
         }
         __syncthreads();
     }
-    result[bx * blockDim.x + t / 16] = isSymmetric;
+    result[bx * blockDim.x + t] = isSymmetric;
 }
-
 
 
 int main() {
@@ -97,34 +99,32 @@ int main() {
 
     srand(static_cast<unsigned>(time(nullptr))); // Инициализируем генератор случайных чисел
 
-    const int numRows = 50000;
-    const int numCols = 1024;
-    /*const int blockDim = 1024;*/
-    const int matrixSize = numRows * numCols;
+    const int rows = 50000;
+    const int cols = 1024;
+    const int matrixSize = rows * cols;
+
     const int blockDim = 256;
-    const int numBlocks = (numRows + 256 - 1) / 256;
+    const int numBlocks = (rows + 256 - 1) / 256;
 
     int* h_matrix = new int[matrixSize]; 
-    bool* h_symmetryResults = new bool[numRows]; 
+    bool* h_symmetryResults = new bool[rows];
+    bool* cpu_symmetryResults = new bool[rows];
 
     // Генерируем случайную матрицу на хосте
-    GenerateRandomMatrix(h_matrix, numRows, numCols);
+    GenerateRandomMatrix(h_matrix, rows, cols);
 
     startCPU = clock();
 
     // Проверяем симметрию строк и сохраняем результаты в векторе
-    bool symmetryResults[numRows];
-    for (int i = 0; i < numRows; ++i) {
-        symmetryResults[i] = IsRowSymmetric(h_matrix + i * numCols, numCols);
-
-    }
+    checkSymmetryCPU(h_matrix, cpu_symmetryResults, rows, cols);
+    
     elapsedTimeCPU = (float)(clock() - startCPU) / CLOCKS_PER_SEC;
 
     // Выделяем память на устройстве
     int* d_matrix;
-    int* d_symmetryResults;
+    bool* d_symmetryResults;
     cudaMalloc((void**)&d_matrix, sizeof(int) * matrixSize);
-    cudaMalloc((void**)&d_symmetryResults, sizeof(bool) * numRows);
+    cudaMalloc((void**)&d_symmetryResults, sizeof(bool) * rows);
 
     // Копируем матрицу с хоста на устройство
     cudaMemcpy(d_matrix, h_matrix, sizeof(int) * matrixSize, cudaMemcpyHostToDevice);
@@ -132,29 +132,29 @@ int main() {
     cudaEventRecord(startCUDA, 0);
    
     // Вызываем на GPU для проверки симметрии
-    IsRowSymmetricGPU <<<numBlocks, blockDim>>> (d_matrix, d_symmetryResults, numRows, numCols);
+    checkSymmetryGPU <<<numBlocks, blockDim>>> (d_matrix, d_symmetryResults, rows, cols);
 
     cudaEventRecord(stopCUDA, 0);
     cudaEventSynchronize(stopCUDA);
     cudaEventElapsedTime(&elapsedTimeCUDA, startCUDA, stopCUDA);
 
     // Копируем результаты с устройства на хост
-    cudaMemcpy(h_symmetryResults, d_symmetryResults, sizeof(bool) * numRows, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_symmetryResults, d_symmetryResults, sizeof(bool) * rows, cudaMemcpyDeviceToHost);
 
     // Освобождаем память на устройстве
     cudaFree(d_matrix);
     cudaFree(d_symmetryResults);
 
     // Выводим результаты на консоль
-    for (int i = 0; i < numRows; ++i) {
-        std::cout << "Row " << i << ": " << (h_symmetryResults[i] ? "Symmetric" : "Not Symmetric") << "\t"
-             << (symmetryResults[i] ? "Symmetric" : "Not Symmetric") << std::endl;
-    }
+    //for (int i = 0; i < rows; ++i) {
+    //    std::cout << "Row " << i << ": " << (h_symmetryResults[i] ? "Symmetric" : "Not Symmetric") << "\t"
+    //         << (cpu_symmetryResults[i] ? "Symmetric" : "Not Symmetric") << std::endl;
+    //}
 
     // Сравниваем результаты CPU и GPU
     bool resultsMatch = true;
-    for (int i = 0; i < numRows; ++i) {
-        if (symmetryResults[i] != h_symmetryResults[i]) {
+    for (int i = 0; i < rows; ++i) {
+        if (cpu_symmetryResults[i] != h_symmetryResults[i]) {
             resultsMatch = false;
             break;
         }
